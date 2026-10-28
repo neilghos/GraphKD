@@ -4,10 +4,18 @@ import torch.nn.functional as F
 from dataloader import get_tiny_imagenet_loaders
 from student import ModularStudent
 
-def evaluate_split(split_name="test", checkpoint_path="student_baseline.pt", batch_size=128):
+def evaluate_split(split_name="test", checkpoint_path="student_baseline.pt", head_type=None, batch_size=128):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # Auto-detect head_type if not specified
+    if head_type is None:
+        state_dict = torch.load(checkpoint_path, map_location=device, weights_only=True)
+        head_type = "inductive" if "sat1_conv.0.weight" in state_dict else "mlp"
+    else:
+        state_dict = torch.load(checkpoint_path, map_location=device, weights_only=True)
+
     print("=" * 70)
-    print(f" EVALUATION ON SPLIT: [{split_name.upper()}]")
+    print(f" EVALUATION ON SPLIT: [{split_name.upper()}] (Head Type: {head_type})")
     print(f" Device: {device} | Checkpoint: {checkpoint_path}")
     print("=" * 70)
 
@@ -28,8 +36,7 @@ def evaluate_split(split_name="test", checkpoint_path="student_baseline.pt", bat
     print(f"Loaded {split_name} split: {total_samples} images across 200 classes.")
 
     # 2. Load Model
-    student = ModularStudent(core_dim=128, sat1_dim=32, sat2_dim=16, num_classes=200).to(device)
-    state_dict = torch.load(checkpoint_path, map_location=device, weights_only=True)
+    student = ModularStudent(core_dim=128, sat1_dim=32, sat2_dim=16, num_classes=200, head_type=head_type).to(device)
     student.load_state_dict(state_dict)
     student.eval()
 
@@ -37,8 +44,15 @@ def evaluate_split(split_name="test", checkpoint_path="student_baseline.pt", bat
     total_params = sum(p.numel() for p in student.parameters())
     trunk_params = sum(p.numel() for p in student.trunk.parameters())
     core_params = sum(p.numel() for p in student.core_head.parameters())
-    sat1_params = sum(p.numel() for p in student.sat1_head.parameters())
-    sat2_params = sum(p.numel() for p in student.sat2_head.parameters())
+    if hasattr(student, 'sat1_head'):
+        sat1_params = sum(p.numel() for p in student.sat1_head.parameters())
+        sat2_params = sum(p.numel() for p in student.sat2_head.parameters())
+    else:
+        sat1_params = sum(p.numel() for p in student.sat1_conv.parameters()) + sum(p.numel() for p in student.sat1_proj.parameters())
+        sat2_params = (sum(p.numel() for p in student.sat2_in_proj.parameters()) +
+                       sum(p.numel() for p in student.sat2_mha.parameters()) +
+                       sum(p.numel() for p in student.sat2_ln.parameters()) +
+                       sum(p.numel() for p in student.sat2_proj.parameters()))
     gate_params = sum(p.numel() for p in student.gate.parameters())
     cls_params = sum(p.numel() for p in student.classifier.parameters())
 
@@ -113,5 +127,12 @@ def evaluate_split(split_name="test", checkpoint_path="student_baseline.pt", bat
     print("=" * 70 + "\n")
 
 if __name__ == "__main__":
-    evaluate_split("validation")
-    evaluate_split("test")
+    import argparse
+    parser = argparse.ArgumentParser(description="Evaluate Student Checkpoint on Validation and Test splits")
+    parser.add_argument("checkpoint", nargs="?", default="student_baseline.pt", help="Path to checkpoint file")
+    parser.add_argument("--head-type", type=str, default=None, choices=["mlp", "inductive"], help="Head type (auto-detected if None)")
+    parser.add_argument("--batch-size", type=int, default=128, help="Batch size")
+    args = parser.parse_args()
+
+    evaluate_split("validation", checkpoint_path=args.checkpoint, head_type=args.head_type, batch_size=args.batch_size)
+    evaluate_split("test", checkpoint_path=args.checkpoint, head_type=args.head_type, batch_size=args.batch_size)

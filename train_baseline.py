@@ -95,12 +95,16 @@ def main():
     parser.add_argument("--use-l2-kd", action="store_true", help="Use L2 MSE loss for KD instead of KL divergence")
     parser.add_argument("--targets-path", type=str, default="tiny_teacher_targets.pt", help="Path to precomputed teacher targets")
     parser.add_argument("--max-batches", type=int, default=None, help="Limit batches per epoch (for quick testing)")
-    parser.add_argument("--save-path", type=str, default="student_baseline.pt", help="Checkpoint save path")
+    parser.add_argument("--head-type", type=str, choices=["mlp", "inductive"], default="inductive", help="Specialist architecture ('mlp' or 'inductive')")
+    parser.add_argument("--save-path", type=str, default=None, help="Checkpoint save path")
     args = parser.parse_args()
+
+    if args.save_path is None:
+        args.save_path = f"student_{args.head_type}.pt"
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Starting Blazing-Fast Pre-GNN Distillation on Tiny-ImageNet-200")
-    print(f"Device: {device} | Epochs: {args.epochs} | Batch Size: {args.batch_size} | LR: {args.lr} | L2/WD: {args.l2}")
+    print(f"Device: {device} | Epochs: {args.epochs} | Batch Size: {args.batch_size} | LR: {args.lr} | L2/WD: {args.l2} | Head Type: {args.head_type}")
 
     if not os.path.exists(args.targets_path):
         print(f"\n[!] Precomputed targets not found at '{args.targets_path}'.")
@@ -110,7 +114,7 @@ def main():
     train_loader, val_loader = get_tiny_imagenet_distill_loaders(targets_path=args.targets_path, batch_size=args.batch_size)
     print(f"Loaded {len(train_loader)} training batches with precomputed teacher graph targets.\n")
 
-    student = ModularStudent(core_dim=128, sat1_dim=32, sat2_dim=16, num_classes=200).to(device)
+    student = ModularStudent(core_dim=128, sat1_dim=32, sat2_dim=16, num_classes=200, head_type=args.head_type).to(device)
     opt_s = torch.optim.AdamW(student.parameters(), lr=args.lr, weight_decay=args.l2)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt_s, T_max=args.epochs, eta_min=1e-5)
     scaler = torch.amp.GradScaler("cuda")
