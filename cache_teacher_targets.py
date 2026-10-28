@@ -11,11 +11,24 @@ def precompute_teachers(save_path="tiny_teacher_targets.pt", batch_size=256):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Precomputing Teacher Targets on: {device} (Batch size: {batch_size})")
 
-    train_loader, val_loader = get_tiny_imagenet_loaders(batch_size=batch_size)
+    # Clean deterministic transform for feature caching (no random crops/flips)
+    from torchvision import transforms
+    from datasets import load_from_disk
+    from dataloader import TinyImageNetHFDataset
+    from torch.utils.data import DataLoader
+
+    transform_clean = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    ])
+    ds = load_from_disk("tiny-imagenet-200-clean/tiny-imagenet-200-clean")
+    train_set = TinyImageNetHFDataset(ds['train'], transform=transform_clean)
+    train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=False, num_workers=0, pin_memory=True)
+
     teachers = DualBackbone(pretrained=True).to(device).eval()
 
     # 1. Extract frozen features for entire training set (~2.5 minutes)
-    print("Step 1/3: Extracting frozen features from ResNet-18 & Swin-T...")
+    print("Step 1/3: Extracting sequential clean features from ResNet-18 & Swin-T...")
     f1_list, f2_list, label_list = [], [], []
     t0 = time.time()
 
@@ -61,7 +74,7 @@ def precompute_teachers(save_path="tiny_teacher_targets.pt", batch_size=256):
     dataset_tensor = torch.utils.data.TensorDataset(t_core, t_sat1, t_sat2, all_labels)
     feat_loader = torch.utils.data.DataLoader(dataset_tensor, batch_size=512, shuffle=True)
 
-    for ep in range(1, 6):
+    for ep in range(1, 9):
         total_loss, correct, total = 0.0, 0, 0
         for c, s1, s2, y in feat_loader:
             c, s1, s2, y = c.to(device), s1.to(device), s2.to(device), y.to(device)
@@ -72,7 +85,7 @@ def precompute_teachers(save_path="tiny_teacher_targets.pt", batch_size=256):
             total_loss += loss.item() * y.size(0)
             correct += (logits.argmax(dim=-1) == y).sum().item()
             total += y.size(0)
-        print(f"  Teacher Probe Epoch {ep}/5 | Loss: {total_loss/total:.4f} | Accuracy: {correct/total*100:.2f}%")
+        print(f"  Teacher Probe Epoch {ep}/8 | Loss: {total_loss/total:.4f} | Accuracy: {correct/total*100:.2f}%")
 
     # Generate teacher target logits for all 98,179 samples
     head_core.eval(); head_sat1.eval(); head_sat2.eval(); classifier.eval()
@@ -85,6 +98,11 @@ def precompute_teachers(save_path="tiny_teacher_targets.pt", batch_size=256):
             teacher_logits_list.append(classifier(fused).half().cpu())
 
     train_teacher_logits = torch.cat(teacher_logits_list, dim=0)
+
+    # Verification: Ensure teacher targets match the sequential labels perfectly
+    cached_acc = (train_teacher_logits.float().argmax(dim=-1) == all_labels).float().mean().item()
+    print(f"\n[Verification] Cached Teacher Accuracy against Dataset Labels: {cached_acc*100:.2f}%")
+    assert cached_acc > 0.40, f"Teacher accuracy must be high (got {cached_acc*100:.2f}%)!"
 
     # Save cached targets and graph
     torch.save({

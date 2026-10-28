@@ -41,6 +41,7 @@ class TinyImageNetDistillDataset(Dataset):
 
 def get_tiny_imagenet_distill_loaders(targets_path="tiny_teacher_targets.pt", batch_size=128, path="tiny-imagenet-200-clean/tiny-imagenet-200-clean"):
     transform_train = transforms.Compose([
+        transforms.RandomCrop(64, padding=4),
         transforms.RandomHorizontalFlip(),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
@@ -63,8 +64,9 @@ def get_tiny_imagenet_distill_loaders(targets_path="tiny_teacher_targets.pt", ba
     train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True, num_workers=0, pin_memory=True)
     return train_loader, val_loader
 
-def get_tiny_imagenet_loaders(batch_size=128, path="tiny-imagenet-200-clean/tiny-imagenet-200-clean", num_workers=0):
+def get_tiny_imagenet_loaders(batch_size=128, shuffle=True, path="tiny-imagenet-200-clean/tiny-imagenet-200-clean", num_workers=0):
     transform_train = transforms.Compose([
+        transforms.RandomCrop(64, padding=4),
         transforms.RandomHorizontalFlip(),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
@@ -77,7 +79,7 @@ def get_tiny_imagenet_loaders(batch_size=128, path="tiny-imagenet-200-clean/tiny
     ds = load_from_disk(path)
     train_set = TinyImageNetHFDataset(ds['train'], transform=transform_train)
     val_set = TinyImageNetHFDataset(ds['validation'], transform=transform_val)
-    train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=True)
+    train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=shuffle, num_workers=num_workers, pin_memory=True)
     val_loader = DataLoader(val_set, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True)
     return train_loader, val_loader
 
