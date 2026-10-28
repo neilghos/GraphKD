@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Datasets and Archives
+data/
+*.tar.gz
+*.tar
+*.zip
+*.gz
+cifar-10-python.tar.gz
+
+# Checkpoints, Cached Features, and Model Weights
+*.pt
+*.pth
+*.ckpt
+*.bin
+cache_graph_features.pt
+checkpoints/
+
+# Virtual Environments
+env/
+venv/
+.env/
+.venv/
+conda-env/
+
+# IDE and Editor configs
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs and outputs
+logs/
+*.log
+scratch/
