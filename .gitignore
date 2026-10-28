@@ -11,7 +11,9 @@ data/
 *.tar
 *.zip
 *.gz
+*.arrow
 cifar-10-python.tar.gz
+tiny-imagenet-200-clean/
 
 # Checkpoints, Cached Features, and Model Weights
 *.pt
