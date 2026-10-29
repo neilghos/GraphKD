@@ -39,6 +39,64 @@ class TinyImageNetDistillDataset(Dataset):
         t_logit = self.teacher_logits[idx].float()
         return img, label, t_logit
 
+class TinyImageNetDualDataset(Dataset):
+    """Dataset yielding (image, label, t1_logits, t2_logits, t1_feat, t2_feat) for Option B"""
+    def __init__(self, hf_dataset, t1_logits, t2_logits, t1_feat, t2_feat, transform=None):
+        self.ds = hf_dataset
+        self.t1_logits = t1_logits
+        self.t2_logits = t2_logits
+        self.t1_feat = t1_feat
+        self.t2_feat = t2_feat
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.ds)
+
+    def __getitem__(self, idx):
+        item = self.ds[idx]
+        img = item['image'].convert('RGB')
+        label = item['label']
+        if self.transform:
+            img = self.transform(img)
+        t1_l = self.t1_logits[idx].float()
+        t2_l = self.t2_logits[idx].float()
+        t1_f = self.t1_feat[idx].float()
+        t2_f = self.t2_feat[idx].float()
+        return img, label, t1_l, t2_l, t1_f, t2_f
+
+def get_tiny_imagenet_dual_loaders(targets_path="tiny_dual_targets.pt", batch_size=128, path="tiny-imagenet-200-clean/tiny-imagenet-200-clean"):
+    transform_train = transforms.Compose([
+        transforms.RandomCrop(64, padding=4),
+        transforms.RandomHorizontalFlip(),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    ])
+    transform_val = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    ])
+
+    ds = load_from_disk(path)
+    val_set = TinyImageNetHFDataset(ds['validation'], transform=transform_val)
+    val_loader = DataLoader(val_set, batch_size=batch_size, shuffle=False, num_workers=0, pin_memory=True)
+
+    if os.path.exists(targets_path):
+        data = torch.load(targets_path, weights_only=False)
+        train_set = TinyImageNetDualDataset(
+            ds['train'],
+            data["t1_logits"],
+            data["t2_logits"],
+            data["F1"],
+            data["F2"],
+            transform=transform_train
+        )
+    else:
+        raise FileNotFoundError(f"Targets path '{targets_path}' not found. Run python cache_dual_targets.py first!")
+
+    train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True, num_workers=0, pin_memory=True)
+    return train_loader, val_loader
+
+
 def get_tiny_imagenet_distill_loaders(targets_path="tiny_teacher_targets.pt", batch_size=128, path="tiny-imagenet-200-clean/tiny-imagenet-200-clean"):
     transform_train = transforms.Compose([
         transforms.RandomCrop(64, padding=4),
