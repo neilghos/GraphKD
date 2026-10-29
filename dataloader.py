@@ -72,7 +72,7 @@ def get_tiny_imagenet_dual_loaders(targets_path="tiny_dual_targets.pt", batch_si
             transform=transform_train
         )
     else:
-        raise FileNotFoundError(f"Targets path '{targets_path}' not found. Run python cache_dual_targets.py first!")
+        raise FileNotFoundError(f"Targets path '{targets_path}' not found. Run python cache.py first!")
 
     train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True, num_workers=0, pin_memory=True)
     return train_loader, val_loader

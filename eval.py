@@ -7,7 +7,7 @@ from torch.utils.data import DataLoader
 from torchvision import transforms
 from datasets import load_from_disk
 from dataloader import TinyImageNetHFDataset
-from student_dual import DualReconstructionStudent
+from student import DualReconstructionStudent
 
 def evaluate_split(split_name, checkpoint_path="student_dual_option_b.pt", targets_path="tiny_dual_targets.pt", batch_size=128):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

@@ -5,7 +5,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from dataloader import get_tiny_imagenet_dual_loaders
-from student_dual import DualReconstructionStudent
+from student import DualReconstructionStudent
 
 def train_one_epoch(epoch, epochs, student, loader, opt, scaler, device, temp=2.0, alpha=0.5, beta=0.2, max_batches=None):
     student.train()
@@ -150,8 +150,8 @@ def main():
     print("=" * 75)
 
     if not os.path.exists(args.targets_path):
-        print(f"\n[!] Targets not found at '{args.targets_path}'. Running 'python cache_dual_targets.py'...")
-        from cache_dual_targets import main as build_targets
+        print(f"\n[!] Targets not found at '{args.targets_path}'. Running 'python cache.py'...")
+        from cache import main as build_targets
         build_targets()
 
     # Load targets and joint probe
