@@ -4,7 +4,7 @@ import torch.nn.functional as F
 from dataloader import get_tiny_imagenet_loaders
 from student import ModularStudent
 
-def evaluate_split(split_name="test", checkpoint_path="student_baseline.pt", head_type=None, batch_size=128):
+def evaluate_split(split_name="test", checkpoint_path="student_inductive.pt", head_type=None, batch_size=128):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # Auto-detect head_type if not specified
@@ -35,8 +35,8 @@ def evaluate_split(split_name="test", checkpoint_path="student_baseline.pt", hea
     total_samples = len(eval_loader.dataset)
     print(f"Loaded {split_name} split: {total_samples} images across 200 classes.")
 
-    # 2. Load Model
-    student = ModularStudent(core_dim=128, sat1_dim=32, sat2_dim=16, num_classes=200, head_type=head_type).to(device)
+    # 2. Load Model (Native Femto 384-dim: core 336 + sat1 32 + sat2 16 = 384)
+    student = ModularStudent(core_dim=336, sat1_dim=32, sat2_dim=16, num_classes=200, head_type=head_type).to(device)
     student.load_state_dict(state_dict)
     student.eval()
 
@@ -54,14 +54,16 @@ def evaluate_split(split_name="test", checkpoint_path="student_baseline.pt", hea
                        sum(p.numel() for p in student.sat2_ln.parameters()) +
                        sum(p.numel() for p in student.sat2_proj.parameters()))
     gate_params = sum(p.numel() for p in student.gate.parameters())
+    ln_params = sum(p.numel() for p in student.fused_ln.parameters())
     cls_params = sum(p.numel() for p in student.classifier.parameters())
 
     print(f"\n--- Architecture & Parameter Breakdown ---")
-    print(f"  MobileNetV3-Small Trunk : {trunk_params:>10,} params ({trunk_params/total_params*100:4.1f}%)")
+    print(f"  ConvNeXt-Femto Trunk    : {trunk_params:>10,} params ({trunk_params/total_params*100:4.1f}%)")
     print(f"  Core Invariant Head     : {core_params:>10,} params ({core_params/total_params*100:4.1f}%)")
-    print(f"  Sat 1 (ResNet Specialist): {sat1_params:>10,} params ({sat1_params/total_params*100:4.1f}%)")
-    print(f"  Sat 2 (Swin Specialist) : {sat2_params:>10,} params ({sat2_params/total_params*100:4.1f}%)")
+    print(f"  Sat 1 (ConvNeXt Prior)  : {sat1_params:>10,} params ({sat1_params/total_params*100:4.1f}%)")
+    print(f"  Sat 2 (DINOv2 Prior)    : {sat2_params:>10,} params ({sat2_params/total_params*100:4.1f}%)")
     print(f"  Dynamic Router Gate     : {gate_params:>10,} params ({gate_params/total_params*100:4.1f}%)")
+    print(f"  Fused LayerNorm         : {ln_params:>10,} params ({ln_params/total_params*100:4.1f}%)")
     print(f"  Fused Classifier Head   : {cls_params:>10,} params ({cls_params/total_params*100:4.1f}%)")
     print(f"  TOTAL STUDENT PARAMS    : {total_params:>10,} params (~{total_params/1e6:.2f}M)")
 
@@ -90,7 +92,7 @@ def evaluate_split(split_name="test", checkpoint_path="student_baseline.pt", hea
             # Top-1 & Top-5 accuracy
             _, pred = logits.topk(5, dim=-1, largest=True, sorted=True)
             correct_matrix = pred.eq(labels.view(-1, 1).expand_as(pred))
-            
+
             top1_correct += correct_matrix[:, 0].sum().item()
             top5_correct += correct_matrix[:, :5].sum().item()
             total += labels.size(0)
@@ -106,8 +108,8 @@ def evaluate_split(split_name="test", checkpoint_path="student_baseline.pt", hea
     sat1_vals = all_alphas[:, 0]
     sat2_vals = all_alphas[:, 1]
 
-    swin_preferred = (sat2_vals > sat1_vals).float().mean().item() * 100
-    resnet_preferred = (sat1_vals > sat2_vals).float().mean().item() * 100
+    dinov2_preferred = (sat2_vals > sat1_vals).float().mean().item() * 100
+    convnext_preferred = (sat1_vals > sat2_vals).float().mean().item() * 100
 
     top1_acc = (top1_correct / total) * 100
     top5_acc = (top5_correct / total) * 100
@@ -120,16 +122,16 @@ def evaluate_split(split_name="test", checkpoint_path="student_baseline.pt", hea
     print(f"  Inference Latency    : {latency_per_sample_ms:.2f} ms / image ({fps:.1f} FPS on {device})")
 
     print("\n--- Dynamic Gating Router Analysis ---")
-    print(f"  Sat 1 (ResNet-18 Prior) Mean : {sat1_vals.mean().item():.4f} (std: {sat1_vals.std().item():.4f})")
-    print(f"  Sat 2 (Swin-T Prior)    Mean : {sat2_vals.mean().item():.4f} (std: {sat2_vals.std().item():.4f})")
-    print(f"  Swin-T Preferred Images      : {swin_preferred:.2f}%")
-    print(f"  ResNet-18 Preferred Images   : {resnet_preferred:.2f}%")
+    print(f"  Sat 1 (ConvNeXt Prior) Mean  : {sat1_vals.mean().item():.4f} (std: {sat1_vals.std().item():.4f})")
+    print(f"  Sat 2 (DINOv2 Prior)   Mean  : {sat2_vals.mean().item():.4f} (std: {sat2_vals.std().item():.4f})")
+    print(f"  ConvNeXt Preferred Images    : {convnext_preferred:.2f}%")
+    print(f"  DINOv2 Preferred Images      : {dinov2_preferred:.2f}%")
     print("=" * 70 + "\n")
 
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description="Evaluate Student Checkpoint on Validation and Test splits")
-    parser.add_argument("checkpoint", nargs="?", default="student_baseline.pt", help="Path to checkpoint file")
+    parser.add_argument("checkpoint", nargs="?", default="student_inductive.pt", help="Path to checkpoint file")
     parser.add_argument("--head-type", type=str, default=None, choices=["mlp", "inductive"], help="Head type (auto-detected if None)")
     parser.add_argument("--batch-size", type=int, default=128, help="Batch size")
     args = parser.parse_args()
