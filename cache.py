@@ -1,7 +1,76 @@
 import os
+import time
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.data import DataLoader
+from torchvision import transforms
+from datasets import load_from_disk
+import timm
+from dataloader import TinyImageNetHFDataset
+
+class DualBackbone(nn.Module):
+    """Frozen Teacher Ensemble: ConvNeXt-Base (1024d) + DINOv2-ViT-Base (768d)."""
+    def __init__(self):
+        super().__init__()
+        self.bb1 = timm.create_model("convnext_base", pretrained=True, num_classes=0)
+        self.bb2 = timm.create_model(
+            "vit_base_patch14_dinov2.lvd142m",
+            pretrained=True,
+            num_classes=0,
+            dynamic_img_size=True
+        )
+        self.eval()
+        for p in self.parameters():
+            p.requires_grad = False
+
+    @torch.no_grad()
+    def forward(self, x):
+        x_224 = F.interpolate(x, size=(224, 224), mode="bilinear", align_corners=False)
+        f1 = self.bb1(x_224)
+        f2 = self.bb2(x_224)
+        return f1, f2
+
+def extract_teacher_features(features_cache_path, device, batch_size=128, data_path="tiny-imagenet-200-clean/tiny-imagenet-200-clean"):
+    print("=" * 70)
+    print(f" EXTRACTING RAW TEACHER FEATURES -> {features_cache_path}")
+    print("=" * 70)
+    transform_clean = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    ])
+    ds = load_from_disk(data_path)
+    train_set = TinyImageNetHFDataset(ds["train"], transform=transform_clean)
+    loader = DataLoader(train_set, batch_size=batch_size, shuffle=False, num_workers=0, pin_memory=True)
+
+    teachers = DualBackbone().to(device)
+    teachers.eval()
+
+    f1_list, f2_list, label_list = [], [], []
+    start_time = time.time()
+    num_batches = len(loader)
+
+    with torch.no_grad():
+        for i, (images, labels) in enumerate(loader):
+            images = images.to(device, non_blocking=True)
+            with torch.amp.autocast("cuda"):
+                f1, f2 = teachers(images)
+            f1_list.append(f1.half().cpu())
+            f2_list.append(f2.half().cpu())
+            label_list.append(labels.cpu())
+
+            if (i + 1) % 50 == 0 or (i + 1) == num_batches:
+                elapsed = time.time() - start_time
+                print(f"  Cached [{i+1}/{num_batches}] batches ({((i+1)/num_batches)*100:.1f}%) | {elapsed:.1f}s")
+
+    F1 = torch.cat(f1_list, dim=0)
+    F2 = torch.cat(f2_list, dim=0)
+    all_labels = torch.cat(label_list, dim=0)
+
+    torch.save({"F1": F1, "F2": F2, "labels": all_labels}, features_cache_path)
+    print(f"Saved raw teacher features to '{features_cache_path}' ({os.path.getsize(features_cache_path)/(1024*1024):.2f} MB)\n")
+    del teachers
+    torch.cuda.empty_cache()
 
 def fit_probe(features, labels, device, epochs=6, batch_size=512, lr=3e-3):
     in_dim = features.shape[1]
@@ -44,6 +113,11 @@ def main():
     print("=" * 70)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    if not os.path.exists(features_cache_path):
+        print(f"[!] '{features_cache_path}' not found. Extracting teacher features first...")
+        extract_teacher_features(features_cache_path, device)
+
     print(f"Device: {device} | Loading {features_cache_path}...")
     data = torch.load(features_cache_path, map_location="cpu", weights_only=False)
     F1 = data["F1"].float()  # [98179, 1024] ConvNeXt-Base

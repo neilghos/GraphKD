@@ -2,49 +2,48 @@ import time
 import argparse
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.utils.data import DataLoader
-from torchvision import transforms
-from datasets import load_from_disk
-from dataloader import TinyImageNetHFDataset
+from dataloader import load_or_build_uint8_cache, FastTensorEvalDataset
 from student import DualReconstructionStudent
 
-def evaluate_split(split_name, checkpoint_path="student_dual_option_b.pt", targets_path="tiny_dual_targets.pt", batch_size=128):
+def evaluate_split(split_name, checkpoint_path="student_dual_option_b.pt", batch_size=256):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("=" * 75)
-    print(f" EVALUATION ON SPLIT: [{split_name.upper()}] (Option B: Dual-Stream Reconstruction)")
+    print(f" EVALUATION ON SPLIT: [{split_name.upper()}] (Option B: Native 64x64 Dual-Stream)")
     print(f" Device: {device} | Checkpoint: {checkpoint_path}")
     print("=" * 75)
 
-    # 1. Load Data
-    transform_eval = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-    ])
-    ds = load_from_disk("tiny-imagenet-200-clean/tiny-imagenet-200-clean")
-    eval_set = TinyImageNetHFDataset(ds[split_name], transform=transform_eval)
+    # 1. Load Data from RAM Cache
+    img_cache = load_or_build_uint8_cache()
+    eval_set = FastTensorEvalDataset(img_cache[split_name]["images"], img_cache[split_name]["labels"])
     eval_loader = DataLoader(eval_set, batch_size=batch_size, shuffle=False, num_workers=0, pin_memory=True)
     total_samples = len(eval_loader.dataset)
     print(f"Loaded {split_name} split: {total_samples} images across 200 classes.")
 
+    mean = torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1)
+    std = torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1)
+
     # 2. Load Models
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
-    student = DualReconstructionStudent(num_classes=200).to(device)
+    student = DualReconstructionStudent(num_classes=200, pretrained=False).to(device)
     student.load_state_dict(ckpt["student_state"])
     student.eval()
 
     joint_probe = nn.Linear(1792, 200).to(device)
-    joint_probe.load_state_dict(ckpt["joint_probe_state"])
+    if "joint_probe_state" in ckpt:
+        joint_probe.load_state_dict(ckpt["joint_probe_state"])
     joint_probe.eval()
 
     total_params = sum(p.numel() for p in student.parameters())
-    trunk_params = sum(p.numel() for p in student.trunk.parameters())
-    conv_spec_params = sum(p.numel() for p in student.conv_spec.parameters()) + sum(p.numel() for p in student.head_conv.parameters()) + sum(p.numel() for p in student.conv_ln.parameters())
-    dino_spec_params = (sum(p.numel() for p in student.dino_in_proj.parameters()) +
-                        sum(p.numel() for p in student.dino_mha.parameters()) +
-                        sum(p.numel() for p in student.dino_out_proj.parameters()) +
-                        sum(p.numel() for p in student.head_dino.parameters()) +
-                        sum(p.numel() for p in student.dino_ln.parameters()))
+    trunk_params = sum(p.numel() for p in student.trunk.parameters()) + sum(p.numel() for p in student.core_ln.parameters())
+    conv_spec_params = (sum(p.numel() for p in student.conv_island.parameters()) +
+                        sum(p.numel() for p in student.conv_proj.parameters()) +
+                        sum(p.numel() for p in student.recon_conv.parameters()) +
+                        sum(p.numel() for p in student.head_conv.parameters()))
+    dino_spec_params = (sum(p.numel() for p in student.dino_island.parameters()) +
+                        sum(p.numel() for p in student.dino_proj.parameters()) +
+                        sum(p.numel() for p in student.recon_dino.parameters()) +
+                        sum(p.numel() for p in student.head_dino.parameters()))
 
     print(f"\n--- Architecture & Parameter Breakdown ---")
     print(f"  Shared Femto Trunk      : {trunk_params:>10,} params ({trunk_params/total_params*100:4.1f}%)")
@@ -62,12 +61,12 @@ def evaluate_split(split_name, checkpoint_path="student_dual_option_b.pt", targe
     start_eval_time = time.time()
     with torch.no_grad():
         for images, labels in eval_loader:
-            images = images.to(device, non_blocking=True)
+            images = images.to(device, non_blocking=True).float().div_(255.0)
+            images = (images - mean) / std
             labels = labels.to(device, non_blocking=True)
 
             with torch.amp.autocast("cuda"):
-                images_224 = F.interpolate(images, size=(224, 224), mode="bilinear", align_corners=False)
-                logits_conv, logits_dino, logits_ens, _, _, emb_joint = student(images_224)
+                logits_conv, logits_dino, logits_ens, _, _, emb_joint = student(images)
                 logits_probe = joint_probe(emb_joint)
 
             # Conv Top-1 & Top-5
@@ -101,7 +100,7 @@ def evaluate_split(split_name, checkpoint_path="student_dual_option_b.pt", targe
     fps = total / eval_duration
 
     print("\n" + "=" * 75)
-    print(f" FINAL [{split_name.upper()}] BENCHMARK RESULTS (OPTION B)")
+    print(f" FINAL [{split_name.upper()}] BENCHMARK RESULTS (OPTION B | NATIVE 64x64)")
     print("=" * 75)
     print(f"  ConvNeXt Stream Top-1  : {top1_conv/total*100:.2f}%  | Top-5: {top5_conv/total*100:.2f}%")
     print(f"  DINOv2 Stream Top-1    : {top1_dino/total*100:.2f}%  | Top-5: {top5_dino/total*100:.2f}%")
@@ -113,7 +112,7 @@ def evaluate_split(split_name, checkpoint_path="student_dual_option_b.pt", targe
 def main():
     parser = argparse.ArgumentParser(description="Evaluate Option B Student")
     parser.add_argument("checkpoint", nargs="?", default="student_dual_option_b.pt", help="Path to checkpoint")
-    parser.add_argument("--batch-size", type=int, default=128, help="Batch size")
+    parser.add_argument("--batch-size", type=int, default=256, help="Batch size")
     args = parser.parse_args()
 
     evaluate_split("validation", checkpoint_path=args.checkpoint, batch_size=args.batch_size)
