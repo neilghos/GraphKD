@@ -1,4 +1,5 @@
 import os
+import copy
 import time
 import argparse
 import torch
@@ -95,8 +96,6 @@ def build_or_load_dual_backbone_graph_1792(
     corr = corr.clamp(-0.99, 0.99)
 
     abs_corr = corr.abs()
-    # Select top-(top_k//2) intra-backbone neighbors AND top-(top_k//2) cross-backbone neighbors per node
-    # so when nodes are deleted in one backbone, strong bridges from the OTHER backbone are always wired!
     k_half = top_k // 2
     mask = torch.zeros_like(corr)
 
@@ -115,8 +114,6 @@ def build_or_load_dual_backbone_graph_1792(
     mask = torch.maximum(mask, mask.t())
     adj_init = (corr * mask).cpu()
 
-    # Compute node redundancy score: nodes with highest correlation to neighbors are easiest for the
-    # graph to reconstruct when deleted, whereas isolated/unique bridge hubs are preserved longest!
     redundancy_score = (abs_corr * mask).sum(dim=-1).cpu()
     node_redundancy_order = torch.argsort(redundancy_score, descending=True)
 
@@ -140,15 +137,6 @@ def build_or_load_dual_backbone_graph_1792(
 class GraphEditingGNN(nn.Module):
     """
     3-Layer 1792-Node Filter Graph Editing Engine.
-
-    Graph Node Deletion Mechanics:
-      - `alive_mask` in {0, 1}^1792 indicates which filter nodes exist in the current edited graph G_t.
-      - Deleted nodes (`alive_mask[i] == 0`) have their input activation zeroed (`H_z[i] = 0`)
-        AND their outgoing edges in Layer 1 zeroed (`A_tilde[:, i] = 0`), because deleted nodes
-        no longer exist as sources!
-      - Incoming edges TO deleted nodes remain open (`A_tilde[i, j]` for alive j), so Layer 1
-        fills deleted nodes from their 1-hop surviving neighbors, Layer 2 propagates 2-hop
-        surviving neighbor features across the whole graph, and Layer 3 refines 3-hop features!
     """
     def __init__(self, num_nodes=1792, num_layers=3, adj_init=None, feat_mean=None, feat_std=None):
         super().__init__()
@@ -168,12 +156,10 @@ class GraphEditingGNN(nn.Module):
         self.register_buffer("feat_mean", feat_mean.view(num_nodes, 1).clone())
         self.register_buffer("feat_std", feat_std.view(num_nodes, 1).clamp(min=1e-4).clone())
 
-        # Learnable weighted connections per hop
         self.adj_weights = nn.ParameterList([
             nn.Parameter(adj_init.clone()) for _ in range(num_layers)
         ])
 
-        # Per-node hop scales for alive nodes vs. deleted (reconstructed) nodes
         self.alive_scales = nn.ParameterList([
             nn.Parameter(torch.full((num_nodes, 1), 0.05)) for _ in range(num_layers)
         ])
@@ -181,15 +167,9 @@ class GraphEditingGNN(nn.Module):
             nn.Parameter(torch.full((num_nodes, 1), 1.0)) for _ in range(num_layers)
         ])
 
-        # Per-node skip projection from all 3 hops [h1, h2, h3] -> reconstructed node value
         self.hop_mix = nn.Parameter(torch.tensor([0.50, 0.30, 0.20]).view(1, 3, 1).repeat(num_nodes, 1, 1))
 
     def _get_layer_adj(self, layer_idx, source_mask=None):
-        """
-        Row-normalized signed adjacency matrix.
-        In Layer 0 (1-hop from raw filters), `source_mask` zeros out columns of deleted nodes
-        so deleted nodes cannot send zeros/noise; only surviving nodes send signal!
-        """
         W = torch.tanh(self.adj_weights[layer_idx]) * self.edge_mask
         if source_mask is not None:
             W = W * source_mask.view(1, -1)
@@ -197,32 +177,22 @@ class GraphEditingGNN(nn.Module):
         return W / deg
 
     def forward(self, X_raw, alive_mask):
-        """
-        Args:
-            X_raw:      [B, 1792] filter bank outputs.
-            alive_mask: [1792] float tensor (1.0 = alive filter node, 0.0 = deleted node).
-        """
         with torch.amp.autocast("cuda", enabled=False):
             X_f32 = X_raw.float()
             alive_col = alive_mask.view(self.num_nodes, 1).float()  # [1792, 1]
             deleted_col = 1.0 - alive_col                           # [1792, 1]
 
-            # Transpose to graph node view: 1792 nodes, each with B batch features
             H = X_f32.t()  # [1792, B]
-
-            # Standardize into z-score space; zero out deleted nodes strictly
             H_z = ((H - self.feat_mean) / self.feat_std).clamp(-12.0, 12.0)
-            H_0 = H_z * alive_col  # Deleted nodes are strictly 0.0 (removed from graph!)
+            H_0 = H_z * alive_col
 
-            # Hop 1: Only alive nodes (alive_col) can send messages in Hop 1!
-            # After Hop 1, deleted nodes have been filled with 1-hop neighbor water, so in Hops 2 & 3
-            # they can participate in multi-hop relay!
+            # Hop 1: Only surviving nodes send messages in Hop 1
             A1 = self._get_layer_adj(0, source_mask=alive_col.squeeze(-1))
-            m1 = torch.matmul(A1, H_0)  # [1792, B]
+            m1 = torch.matmul(A1, H_0)
             H_1 = alive_col * (H_0 + 0.5 * torch.tanh(self.alive_scales[0]) * F.gelu(m1)) + \
                   deleted_col * (self.deleted_scales[0] * m1)
 
-            # Hop 2: 2-hop relational propagation across the whole filled graph
+            # Hop 2: 2-hop relational propagation across the filled graph
             A2 = self._get_layer_adj(1, source_mask=None)
             m2 = torch.matmul(A2, F.gelu(H_1))
             H_2 = alive_col * (H_1 + 0.5 * torch.tanh(self.alive_scales[1]) * m2) + \
@@ -234,28 +204,19 @@ class GraphEditingGNN(nn.Module):
             H_3 = alive_col * (H_2 + 0.5 * torch.tanh(self.alive_scales[2]) * m3) + \
                   deleted_col * (H_2 + self.deleted_scales[2] * m3)
 
-            # Combine multi-hop reconstructions for deleted nodes + refined surviving nodes
             hops_stack = torch.stack([H_1, H_2, H_3], dim=1)  # [1792, 3, B]
             w_hops = F.softmax(self.hop_mix, dim=1)           # [1792, 3, 1]
             H_recon = (hops_stack * w_hops).sum(dim=1)        # [1792, B]
 
             H_final_z = (alive_col * H_3 + deleted_col * H_recon).clamp(-12.0, 12.0)
-            H_out = H_final_z * self.feat_std + self.feat_mean  # [1792, B]
+            H_out = H_final_z * self.feat_std + self.feat_mean
 
-            return H_out.t().to(X_raw.dtype)  # [B, 1792]
+            return H_out.t().to(X_raw.dtype)
 
 
 class DualBackboneGraphEditor(nn.Module):
     """
-    No Separate Student: Direct Dual-Backbone Filter Bank + 1792-Node Graph Editing Engine.
-
-    - ConvNeXt Filter Bank (`filter_bank_conv`: 1024 -> 1024, initialized to Identity I_1024)
-    - DINOv2 Filter Bank   (`filter_bank_dino`: 768 -> 768, initialized to Identity I_768)
-    - `alive_mask` in {0, 1}^1792: As Cumulative MFH increases, filter nodes are permanently
-      zeroed out and removed (`alive_mask[i] = 0`, filter bank row zeroed).
-    - `GraphEditingGNN`: Routes surviving intra- and cross-backbone filter activations to
-      reconstruct the deleted filter nodes so both models distill inside themselves while the
-      other model acts as the teacher.
+    Direct Dual-Backbone Filter Bank + 1792-Node Graph Editing Engine.
     """
     def __init__(
         self,
@@ -269,7 +230,6 @@ class DualBackboneGraphEditor(nn.Module):
         super().__init__()
         self.num_nodes = 1792
 
-        # Trainable Final Filter Banks of ConvNeXt-Base (1024d) and DINOv2-Base (768d)
         self.filter_bank_conv = nn.Linear(1024, 1024)
         self.filter_bank_dino = nn.Linear(768, 768)
         with torch.no_grad():
@@ -278,7 +238,6 @@ class DualBackboneGraphEditor(nn.Module):
             nn.init.eye_(self.filter_bank_dino.weight)
             nn.init.zeros_(self.filter_bank_dino.bias)
 
-        # 1792-Node Graph Editing GNN Engine
         self.gnn = GraphEditingGNN(
             num_nodes=1792,
             num_layers=3,
@@ -287,7 +246,6 @@ class DualBackboneGraphEditor(nn.Module):
             feat_std=feat_std,
         )
 
-        # Post-Graph Residual Basis Calibration (Identity-initialized)
         self.post_conv = nn.Linear(1024, 1024)
         self.post_dino = nn.Linear(768, 768)
         with torch.no_grad():
@@ -296,7 +254,6 @@ class DualBackboneGraphEditor(nn.Module):
             nn.init.eye_(self.post_dino.weight)
             nn.init.zeros_(self.post_dino.bias)
 
-        # Classifier Heads (initialized from Teacher Probes)
         self.head_conv = nn.Linear(1024, num_classes)
         self.head_dino = nn.Linear(768, num_classes)
         if probe_conv_state is not None:
@@ -304,21 +261,11 @@ class DualBackboneGraphEditor(nn.Module):
         if probe_dino_state is not None:
             self.head_dino.load_state_dict(probe_dino_state)
 
-        # Graph Editing State: 1.0 = Alive Node, 0.0 = Deleted Node
         self.register_buffer("alive_mask", torch.ones(1792, dtype=torch.float32))
 
     @torch.no_grad()
-    def edit_graph_delete_nodes(self, target_delete_ratio: float, node_order: torch.Tensor):
-        """
-        Permanently removes (zeros out) the first `K = round(target_delete_ratio * 1792)`
-        filter nodes in `node_order`, zeroing both `alive_mask[idx]` and the corresponding
-        filter row in `filter_bank_conv` or `filter_bank_dino`.
-        """
-        target_deleted = int(round(target_delete_ratio * self.num_nodes))
-        if target_deleted <= 0:
-            return 0, 0
-
-        nodes_to_delete = node_order[:target_deleted]
+    def delete_subset_nodes(self, nodes_to_delete: torch.Tensor):
+        """Permanently removes (zeros out) all filter node indices in `nodes_to_delete`."""
         newly_deleted = 0
         for idx in nodes_to_delete.tolist():
             if self.alive_mask[idx] > 0.5:
@@ -332,7 +279,6 @@ class DualBackboneGraphEditor(nn.Module):
                     self.filter_bank_dino.weight[d_idx].zero_()
                     self.filter_bank_dino.bias[d_idx].zero_()
 
-        # Also enforce zero weights on all currently deleted filter rows
         conv_alive = self.alive_mask[:1024].view(-1, 1)
         dino_alive = self.alive_mask[1024:].view(-1, 1)
         self.filter_bank_conv.weight.mul_(conv_alive)
@@ -344,8 +290,14 @@ class DualBackboneGraphEditor(nn.Module):
         return newly_deleted, total_deleted
 
     @torch.no_grad()
+    def edit_graph_delete_nodes(self, target_delete_ratio: float, node_order: torch.Tensor):
+        target_deleted = int(round(target_delete_ratio * len(node_order)))
+        if target_deleted <= 0:
+            return 0, int((self.alive_mask < 0.5).sum().item())
+        return self.delete_subset_nodes(node_order[:target_deleted])
+
+    @torch.no_grad()
     def mask_deleted_filter_grads(self):
-        """Ensures deleted filter rows in filter_bank_conv & filter_bank_dino stay strictly zero."""
         conv_alive = self.alive_mask[:1024].view(-1, 1)
         dino_alive = self.alive_mask[1024:].view(-1, 1)
         if self.filter_bank_conv.weight.grad is not None:
@@ -358,15 +310,12 @@ class DualBackboneGraphEditor(nn.Module):
             self.filter_bank_dino.bias.grad.mul_(dino_alive.squeeze(-1))
 
     def forward(self, f1_in, f2_in):
-        # 1. Extract active filters from both backbones (deleted nodes output 0.0)
         c_filters = self.filter_bank_conv(f1_in) * self.alive_mask[:1024].view(1, -1)
         d_filters = self.filter_bank_dino(f2_in) * self.alive_mask[1024:].view(1, -1)
         X_raw = torch.cat([c_filters, d_filters], dim=-1)  # [B, 1792]
 
-        # 2. Propagate across the edited 1792-node filter graph to reconstruct deleted nodes
         X_gnn = self.gnn(X_raw, self.alive_mask)            # [B, 1792]
 
-        # 3. Post-graph stream representations & logits
         emb_conv = self.post_conv(X_gnn[:, :1024])          # [B, 1024]
         emb_dino = self.post_dino(X_gnn[:, 1024:])          # [B, 768]
 
@@ -376,22 +325,6 @@ class DualBackboneGraphEditor(nn.Module):
         emb_joint = torch.cat([emb_conv, emb_dino], dim=-1) # [B, 1792]
 
         return logits_conv, logits_dino, logits_ens, emb_conv, emb_dino, emb_joint
-
-
-def get_graph_edit_schedule(epoch: int, max_delete: float = 0.50) -> float:
-    """
-    Progressive Graph Node Deletion Schedule (Cumulative MFH):
-      - Epochs 1..2:   0.0% deleted (1792/1792 nodes alive -> starts at ~88-90% teacher accuracy!)
-      - Epochs 3..72:  Linearly removes nodes from 0% up to `max_delete` (e.g. 50% = 896 nodes deleted!)
-      - Epochs 73..100: Locked at `max_delete` so the surviving subgraph finishes mutual distillation.
-    """
-    if epoch < 3:
-        return 0.0
-    elif epoch <= 72:
-        progress = (epoch - 2) / 70.0
-        return max_delete * progress
-    else:
-        return max_delete
 
 
 @torch.no_grad()
@@ -438,17 +371,267 @@ def evaluate_graph_editor(model, eval_dict, joint_probe, device, batch_size=256)
     }
 
 
+def train_one_graph_epoch(model, train_loader, optimizer, temp, device):
+    model.train()
+    total_loss = 0.0
+    total = 0
+
+    for f1_b, f2_b, y_b, t1_l, t2_l in train_loader:
+        f1_b = f1_b.to(device, non_blocking=True).float()
+        f2_b = f2_b.to(device, non_blocking=True).float()
+        y_b = y_b.to(device, non_blocking=True)
+        t1_l = t1_l.to(device, non_blocking=True).float()
+        t2_l = t2_l.to(device, non_blocking=True).float()
+
+        logits_c, logits_d, _, emb_c, emb_d, _ = model(f1_b, f2_b)
+
+        # Mutual Cross-Backbone Teacher Supervision:
+        #   - ConvNeXt is taught by DINOv2 Teacher (t2_l) + its intact manifold (f1_b)
+        #   - DINOv2   is taught by ConvNeXt Teacher (t1_l) + its intact manifold (f2_b)
+        ce_c = F.cross_entropy(logits_c, y_b, label_smoothing=0.1)
+        kl_c_from_dino = F.kl_div(
+            F.log_softmax(logits_c / temp, dim=-1),
+            F.softmax(t2_l / temp, dim=-1),
+            reduction="batchmean",
+        ) * (temp ** 2)
+        kl_c_self = F.kl_div(
+            F.log_softmax(logits_c / temp, dim=-1),
+            F.softmax(t1_l / temp, dim=-1),
+            reduction="batchmean",
+        ) * (temp ** 2)
+        feat_c = (1.0 - F.cosine_similarity(emb_c, f1_b, dim=-1)).mean() + 2.0 * F.smooth_l1_loss(emb_c, f1_b)
+        loss_c = 0.3 * ce_c + 0.4 * kl_c_from_dino + 0.3 * kl_c_self + 2.0 * feat_c
+
+        ce_d = F.cross_entropy(logits_d, y_b, label_smoothing=0.1)
+        kl_d_from_conv = F.kl_div(
+            F.log_softmax(logits_d / temp, dim=-1),
+            F.softmax(t1_l / temp, dim=-1),
+            reduction="batchmean",
+        ) * (temp ** 2)
+        kl_d_self = F.kl_div(
+            F.log_softmax(logits_d / temp, dim=-1),
+            F.softmax(t2_l / temp, dim=-1),
+            reduction="batchmean",
+        ) * (temp ** 2)
+        feat_d = (1.0 - F.cosine_similarity(emb_d, f2_b, dim=-1)).mean() + 2.0 * F.smooth_l1_loss(emb_d, f2_b)
+        loss_d = 0.3 * ce_d + 0.4 * kl_d_from_conv + 0.3 * kl_d_self + 2.0 * feat_d
+
+        loss = 0.5 * (loss_c + loss_d)
+
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        model.mask_deleted_filter_grads()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=2.0)
+        optimizer.step()
+
+        bs = y_b.size(0)
+        total_loss += loss.item() * bs
+        total += bs
+
+    return total_loss / total
+
+
+def make_optimizer(model, lr_scale=1.0):
+    return torch.optim.AdamW(
+        [
+            {"params": list(model.filter_bank_conv.parameters()) + list(model.filter_bank_dino.parameters()), "lr": 8e-4 * lr_scale, "weight_decay": 1e-4},
+            {"params": list(model.gnn.parameters()), "lr": 2e-3 * lr_scale, "weight_decay": 0.0},
+            {"params": list(model.post_conv.parameters()) + list(model.post_dino.parameters()), "lr": 8e-4 * lr_scale, "weight_decay": 1e-4},
+            {"params": list(model.head_conv.parameters()) + list(model.head_dino.parameters()), "lr": 1e-4 * lr_scale, "weight_decay": 1e-4},
+        ]
+    )
+
+
+def run_pareto_two_stage(
+    model,
+    train_loader,
+    val_test_data,
+    joint_probe,
+    redundancy_order,
+    args,
+    device,
+):
+    """
+    Two-Phase Pareto-Front Graph Editing:
+      - Phase 1 (DINOv2 Pareto Sweep):
+          Progressively deletes DINOv2 nodes (0% -> 85% across 45 epochs) while keeping ConvNeXt intact.
+          Finds the exact editing rate r_DINO* (>= min_delete) that achieves the HIGHEST Validation
+          accuracy for DINOv2, and restores that exact Pareto-optimal DINOv2 subgraph!
+      - Phase 2 (ConvNeXt Pareto Sweep):
+          Starting from the locked Pareto-optimal DINOv2 subgraph, progressively deletes ConvNeXt
+          nodes (0% -> 85% across 45 epochs).
+          Finds the exact editing rate r_Conv* (>= min_delete) that achieves the HIGHEST Validation
+          accuracy for ConvNeXt / Ensemble, and restores that exact Joint Pareto-optimal subgraph!
+      - Phase 3 (Joint Pareto Fine-Tuning, 15 epochs):
+          Fine-tunes the locked Joint Pareto-Optimal subgraph (G_Conv*, G_DINO*) and evaluates on Test!
+    """
+    dino_nodes = redundancy_order[redundancy_order >= 1024]  # 768 DINOv2 nodes in redundancy order
+    conv_nodes = redundancy_order[redundancy_order < 1024]   # 1024 ConvNeXt nodes in redundancy order
+
+    p1_epochs = 45
+    p2_epochs = 45
+    p3_epochs = 15
+    max_sweep_ratio = 0.85
+    min_pareto_ratio = args.min_delete  # Default 0.40 (at least 40% deleted in each backbone)
+
+    print("\n" + "=" * 84)
+    print(f" PHASE 1: DINOv2 PARETO SWEEP (0% -> {max_sweep_ratio*100:.0f}% DINO Deletion over {p1_epochs} Epochs)")
+    print(f" Goal: Find the DINOv2 editing rate (>= {min_pareto_ratio*100:.0f}% deleted) with HIGHEST DINOv2 Val Accuracy")
+    print("=" * 84)
+
+    opt1 = make_optimizer(model, lr_scale=1.0)
+    sched1 = torch.optim.lr_scheduler.CosineAnnealingLR(opt1, T_max=p1_epochs, eta_min=2e-4)
+
+    best_dino_val = -1.0
+    best_dino_state = None
+    best_dino_del_count = 0
+    t0 = time.time()
+
+    for ep in range(1, p1_epochs + 1):
+        # Ramp DINO deletion from 0% (ep 1..2) to 85% (ep 45)
+        dino_del_ratio = 0.0 if ep < 3 else max_sweep_ratio * ((ep - 2) / float(p1_epochs - 2))
+        model.edit_graph_delete_nodes(dino_del_ratio, dino_nodes)
+
+        loss = train_one_graph_epoch(model, train_loader, opt1, args.temp, device)
+        sched1.step()
+
+        c_alive = int(model.alive_mask[:1024].sum().item())
+        d_alive = int(model.alive_mask[1024:].sum().item())
+        d_del = 768 - d_alive
+        d_del_pct = 100.0 * d_del / 768.0
+
+        val_m = evaluate_graph_editor(model, val_test_data["validation"], joint_probe, device)
+        is_pareto_peak = False
+        if (d_del / 768.0) >= min_pareto_ratio and val_m["dino_top1"] > best_dino_val:
+            best_dino_val = val_m["dino_top1"]
+            best_dino_state = copy.deepcopy(model.state_dict())
+            best_dino_del_count = d_del
+            is_pareto_peak = True
+
+        if ep % 3 == 0 or ep == 1 or is_pareto_peak or ep == p1_epochs:
+            peak_tag = " << NEW DINO PARETO PEAK!" if is_pareto_peak else ""
+            print(
+                f"[P1 Ep {ep:2d}/{p1_epochs}] DINO Deleted: {d_del_pct:5.1f}% ({d_del:3d}/768 | Alive: Conv={c_alive}, DINO={d_alive:3d}) | "
+                f"Val: [Conv: {val_m['conv_top1']:.2f}% | DINO: {val_m['dino_top1']:.2f}% | Ens: {val_m['ens_top1']:.2f}%] | "
+                f"{time.time()-t0:.1f}s{peak_tag}"
+            )
+
+    # Restore Phase-1 Pareto-Optimal DINOv2 Subgraph!
+    model.load_state_dict(best_dino_state)
+    d_alive_locked = int(model.alive_mask[1024:].sum().item())
+    print("\n" + "-" * 84)
+    print(
+        f">>> LOCKED PHASE-1 PARETO-OPTIMAL DINOv2 SUBGRAPH: "
+        f"{best_dino_del_count}/768 DINO Nodes Deleted ({100.0*best_dino_del_count/768:.1f}% Removed | "
+        f"{d_alive_locked}/768 Alive) @ Peak DINO Val = {best_dino_val:.2f}%!"
+    )
+    print("-" * 84)
+
+    print("\n" + "=" * 84)
+    print(f" PHASE 2: CONVNEXT PARETO SWEEP (0% -> {max_sweep_ratio*100:.0f}% ConvNeXt Deletion over {p2_epochs} Epochs)")
+    print(f" Goal: With DINOv2 locked at {d_alive_locked}/768 nodes, find the ConvNeXt editing rate (>= {min_pareto_ratio*100:.0f}% deleted) with HIGHEST Val Accuracy")
+    print("=" * 84)
+
+    opt2 = make_optimizer(model, lr_scale=0.8)
+    sched2 = torch.optim.lr_scheduler.CosineAnnealingLR(opt2, T_max=p2_epochs, eta_min=1e-4)
+
+    best_p2_score = -1.0
+    best_p2_state = None
+    best_conv_del_count = 0
+
+    for ep in range(1, p2_epochs + 1):
+        conv_del_ratio = 0.0 if ep < 3 else max_sweep_ratio * ((ep - 2) / float(p2_epochs - 2))
+        model.edit_graph_delete_nodes(conv_del_ratio, conv_nodes)
+
+        loss = train_one_graph_epoch(model, train_loader, opt2, args.temp, device)
+        sched2.step()
+
+        c_alive = int(model.alive_mask[:1024].sum().item())
+        d_alive = int(model.alive_mask[1024:].sum().item())
+        c_del = 1024 - c_alive
+        c_del_pct = 100.0 * c_del / 1024.0
+
+        val_m = evaluate_graph_editor(model, val_test_data["validation"], joint_probe, device)
+        # Joint Pareto metric: maximize Ensemble + ConvNeXt Val accuracy once Conv deletion >= min_pareto_ratio
+        score = 0.5 * (val_m["ens_top1"] + val_m["conv_top1"])
+        is_pareto_peak = False
+        if (c_del / 1024.0) >= min_pareto_ratio and score > best_p2_score:
+            best_p2_score = score
+            best_p2_state = copy.deepcopy(model.state_dict())
+            best_conv_del_count = c_del
+            is_pareto_peak = True
+
+        if ep % 3 == 0 or ep == 1 or is_pareto_peak or ep == p2_epochs:
+            peak_tag = " << NEW JOINT PARETO PEAK!" if is_pareto_peak else ""
+            print(
+                f"[P2 Ep {ep:2d}/{p2_epochs}] Conv Deleted: {c_del_pct:5.1f}% ({c_del:3d}/1024 | Alive: Conv={c_alive:3d}, DINO={d_alive:3d}) | "
+                f"Val: [Conv: {val_m['conv_top1']:.2f}% | DINO: {val_m['dino_top1']:.2f}% | Ens: {val_m['ens_top1']:.2f}%] | "
+                f"{time.time()-t0:.1f}s{peak_tag}"
+            )
+
+    # Restore Phase-2 Joint Pareto-Optimal Subgraph!
+    model.load_state_dict(best_p2_state)
+    c_alive_locked = int(model.alive_mask[:1024].sum().item())
+    total_del_locked = int((model.alive_mask < 0.5).sum().item())
+    print("\n" + "-" * 84)
+    print(
+        f">>> LOCKED JOINT PARETO-OPTIMAL SUBGRAPH: "
+        f"Total Deleted = {total_del_locked}/1792 ({100.0*total_del_locked/1792:.1f}% Removed) | "
+        f"Surviving: ConvNeXt = {c_alive_locked}/1024, DINOv2 = {d_alive_locked}/768"
+    )
+    print("-" * 84)
+
+    print(f"\n[Phase 3] Fine-Tuning Locked Joint Pareto Subgraph ({1792-total_del_locked}/1792 Alive) for {p3_epochs} Epochs...")
+    opt3 = make_optimizer(model, lr_scale=0.4)
+    sched3 = torch.optim.lr_scheduler.CosineAnnealingLR(opt3, T_max=p3_epochs, eta_min=1e-5)
+    best_final_ens = -1.0
+
+    for ep in range(1, p3_epochs + 1):
+        loss = train_one_graph_epoch(model, train_loader, opt3, args.temp, device)
+        sched3.step()
+        val_m = evaluate_graph_editor(model, val_test_data["validation"], joint_probe, device)
+        if val_m["ens_top1"] > best_final_ens:
+            best_final_ens = val_m["ens_top1"]
+            torch.save(
+                {
+                    "epoch": ep,
+                    "model_state_dict": model.state_dict(),
+                    "alive_mask": model.alive_mask,
+                    "deleted_ratio": total_del_locked / 1792.0,
+                    "val_metrics": val_m,
+                },
+                args.save_ckpt,
+            )
+        if ep % 5 == 0 or ep == p3_epochs:
+            print(
+                f"[P3 Ep {ep:2d}/{p3_epochs}] Locked Alive: {1792-total_del_locked}/1792 (Conv={c_alive_locked}, DINO={d_alive_locked}) | "
+                f"Val: [Conv: {val_m['conv_top1']:.2f}% | DINO: {val_m['dino_top1']:.2f}% | "
+                f"Ens: {val_m['ens_top1']:.2f}% (Top-5: {val_m['ens_top5']:.2f}%)]"
+            )
+
+
+def get_graph_edit_schedule(epoch: int, max_delete: float = 0.50) -> float:
+    if epoch < 3:
+        return 0.0
+    elif epoch <= 72:
+        progress = (epoch - 2) / 70.0
+        return max_delete * progress
+    else:
+        return max_delete
+
+
 def main():
     parser = argparse.ArgumentParser(description="KD as Cross-Backbone Graph Editing via Cumulative MFH")
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch-size", type=int, default=256)
-    parser.add_argument("--max-delete", type=float, default=0.50, help="Target fraction of 1792 filter nodes to delete (ignored if order is delete_dino or delete_conv)")
+    parser.add_argument("--max-delete", type=float, default=0.50, help="Target fraction of 1792 filter nodes to delete in single-stage mode")
+    parser.add_argument("--min-delete", type=float, default=0.40, help="Minimum deletion ratio per backbone to consider on the Pareto peak (default: 0.40)")
     parser.add_argument(
         "--order",
         type=str,
-        default="redundancy",
-        choices=["redundancy", "random", "delete_dino", "delete_conv"],
-        help="Node deletion mode: 'redundancy', 'random', 'delete_dino' (delete 100% of DINOv2), or 'delete_conv' (delete 100% of ConvNeXt)",
+        default="pareto_two_stage",
+        choices=["pareto_two_stage", "redundancy", "random", "delete_dino", "delete_conv"],
+        help="Graph editing mode (default: pareto_two_stage)",
     )
     parser.add_argument("--top-k", type=int, default=32)
     parser.add_argument("--temp", type=float, default=2.0)
@@ -467,16 +650,14 @@ def main():
 
     print("=" * 84)
     print(" CROSS-BACKBONE GRAPH EDITING VIA CUMULATIVE MFH (NO SEPARATE STUDENT)")
-    print(f" Device: {device} | Epochs: {args.epochs} | Batch Size: {args.batch_size}")
-    print(f" Target Node Deletion: {args.max_delete*100:.1f}% ({int(round(args.max_delete*1792))}/1792 filters removed) | Mode: {args.order}")
+    print(f" Device: {device} | Mode: {args.order} | Batch Size: {args.batch_size}")
     print("=" * 84)
 
-    # 1. Load Train Targets & One-Time Val/Test Teacher Feature Banks
     train_data = torch.load("tiny_dual_targets.pt", map_location="cpu", weights_only=False)
     val_test_data = load_or_build_val_test_teacher_cache(device=device)
 
-    F1_train = train_data["F1"]           # [98179, 1024]
-    F2_train = train_data["F2"]           # [98179, 768]
+    F1_train = train_data["F1"]
+    F2_train = train_data["F2"]
     t1_logits_train = train_data["t1_logits"]
     t2_logits_train = train_data["t2_logits"]
     img_cache = torch.load("tiny_images_uint8.pt", map_location="cpu", weights_only=False)
@@ -488,7 +669,6 @@ def main():
     for p in joint_probe.parameters():
         p.requires_grad = False
 
-    # 2. Build 1792x1792 Cross-Backbone Filter Adjacency Matrix
     adj_init, feat_mean, feat_std, redundancy_order = build_or_load_dual_backbone_graph_1792(
         F1_train=F1_train,
         F2_train=F2_train,
@@ -496,24 +676,6 @@ def main():
         device=device,
     )
 
-    if args.order == "redundancy":
-        node_order = redundancy_order
-    elif args.order == "delete_dino":
-        # Keep DINOv2 nodes (1024..1791) in their redundancy order first, then ConvNeXt nodes
-        dino_nodes = redundancy_order[redundancy_order >= 1024]
-        conv_nodes = redundancy_order[redundancy_order < 1024]
-        node_order = torch.cat([dino_nodes, conv_nodes], dim=0)
-    elif args.order == "delete_conv":
-        # Keep ConvNeXt nodes (0..1023) in their redundancy order first, then DINOv2 nodes
-        conv_nodes = redundancy_order[redundancy_order < 1024]
-        dino_nodes = redundancy_order[redundancy_order >= 1024]
-        node_order = torch.cat([conv_nodes, dino_nodes], dim=0)
-    else:
-        gen = torch.Generator()
-        gen.manual_seed(args.seed)
-        node_order = torch.randperm(1792, generator=gen)
-
-    # 3. Initialize Dual-Backbone Graph Editor
     model = DualBackboneGraphEditor(
         adj_init=adj_init,
         feat_mean=feat_mean,
@@ -523,7 +685,6 @@ def main():
         num_classes=200,
     ).to(device)
 
-    # 4. Step-0 Benchmark (0% Node Deletion — Unedited Full 1792-Node Graph)
     val0 = evaluate_graph_editor(model, val_test_data["validation"], joint_probe, device)
     test0 = evaluate_graph_editor(model, val_test_data["test"], joint_probe, device)
     print(
@@ -534,122 +695,77 @@ def main():
         f"Ensemble: {test0['ens_top1']:.2f}% (Top-5: {test0['ens_top5']:.2f}%)]"
     )
 
-    # 5. Fast In-RAM Batch Loader over Cached Feature Banks
     train_loader = FastBatchLoader(
         F1_train, F2_train, y_train, t1_logits_train, t2_logits_train,
         batch_size=args.batch_size, shuffle=True
     )
 
-    optimizer = torch.optim.AdamW(
-        [
-            {"params": list(model.filter_bank_conv.parameters()) + list(model.filter_bank_dino.parameters()), "lr": 8e-4, "weight_decay": 1e-4},
-            {"params": list(model.gnn.parameters()), "lr": 2e-3, "weight_decay": 0.0},
-            {"params": list(model.post_conv.parameters()) + list(model.post_dino.parameters()), "lr": 8e-4, "weight_decay": 1e-4},
-            {"params": list(model.head_conv.parameters()) + list(model.head_dino.parameters()), "lr": 1e-4, "weight_decay": 1e-4},
-        ]
-    )
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-5)
-    temp = args.temp
-    best_full_edit_val = 0.0
+    if args.order == "pareto_two_stage":
+        run_pareto_two_stage(
+            model=model,
+            train_loader=train_loader,
+            val_test_data=val_test_data,
+            joint_probe=joint_probe,
+            redundancy_order=redundancy_order,
+            args=args,
+            device=device,
+        )
+    else:
+        if args.order == "redundancy":
+            node_order = redundancy_order
+        elif args.order == "delete_dino":
+            dino_nodes = redundancy_order[redundancy_order >= 1024]
+            conv_nodes = redundancy_order[redundancy_order < 1024]
+            node_order = torch.cat([dino_nodes, conv_nodes], dim=0)
+        elif args.order == "delete_conv":
+            conv_nodes = redundancy_order[redundancy_order < 1024]
+            dino_nodes = redundancy_order[redundancy_order >= 1024]
+            node_order = torch.cat([conv_nodes, dino_nodes], dim=0)
+        else:
+            gen = torch.Generator()
+            gen.manual_seed(args.seed)
+            node_order = torch.randperm(1792, generator=gen)
 
-    print(f"\n[GraphEdit] Starting {args.epochs}-Epoch Progressive Graph Node Deletion + Mutual Cross-Teacher Distillation...")
-    t_start = time.time()
+        optimizer = make_optimizer(model, lr_scale=1.0)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-5)
+        best_full_edit_val = 0.0
+        t_start = time.time()
 
-    for epoch in range(1, args.epochs + 1):
-        model.train()
-        del_ratio = get_graph_edit_schedule(epoch, max_delete=args.max_delete)
-        newly_del, total_del = model.edit_graph_delete_nodes(del_ratio, node_order)
-        alive_total = 1792 - total_del
-        c_alive = int(model.alive_mask[:1024].sum().item())
-        d_alive = int(model.alive_mask[1024:].sum().item())
+        for epoch in range(1, args.epochs + 1):
+            del_ratio = get_graph_edit_schedule(epoch, max_delete=args.max_delete)
+            _, total_del = model.edit_graph_delete_nodes(del_ratio, node_order)
+            c_alive = int(model.alive_mask[:1024].sum().item())
+            d_alive = int(model.alive_mask[1024:].sum().item())
 
-        total_loss = 0.0
-        corr_c, corr_d, corr_e, total = 0, 0, 0, 0
+            avg_loss = train_one_graph_epoch(model, train_loader, optimizer, args.temp, device)
+            scheduler.step()
 
-        for f1_b, f2_b, y_b, t1_l, t2_l in train_loader:
-            f1_b = f1_b.to(device, non_blocking=True).float()
-            f2_b = f2_b.to(device, non_blocking=True).float()
-            y_b = y_b.to(device, non_blocking=True)
-            t1_l = t1_l.to(device, non_blocking=True).float()
-            t2_l = t2_l.to(device, non_blocking=True).float()
-
-            logits_c, logits_d, logits_e, emb_c, emb_d, _ = model(f1_b, f2_b)
-
-            # Mutual Cross-Backbone Teacher Supervision:
-            #   - ConvNeXt stream is taught by DINOv2 Teacher (t2_l) + its intact feature manifold (f1_b) + CE
-            #   - DINOv2 stream   is taught by ConvNeXt Teacher (t1_l) + its intact feature manifold (f2_b) + CE
-            ce_c = F.cross_entropy(logits_c, y_b, label_smoothing=0.1)
-            kl_c_from_dino = F.kl_div(
-                F.log_softmax(logits_c / temp, dim=-1),
-                F.softmax(t2_l / temp, dim=-1),
-                reduction="batchmean",
-            ) * (temp ** 2)
-            kl_c_self = F.kl_div(
-                F.log_softmax(logits_c / temp, dim=-1),
-                F.softmax(t1_l / temp, dim=-1),
-                reduction="batchmean",
-            ) * (temp ** 2)
-            feat_c = (1.0 - F.cosine_similarity(emb_c, f1_b, dim=-1)).mean() + 2.0 * F.smooth_l1_loss(emb_c, f1_b)
-            loss_c = 0.3 * ce_c + 0.4 * kl_c_from_dino + 0.3 * kl_c_self + 2.0 * feat_c
-
-            ce_d = F.cross_entropy(logits_d, y_b, label_smoothing=0.1)
-            kl_d_from_conv = F.kl_div(
-                F.log_softmax(logits_d / temp, dim=-1),
-                F.softmax(t1_l / temp, dim=-1),
-                reduction="batchmean",
-            ) * (temp ** 2)
-            kl_d_self = F.kl_div(
-                F.log_softmax(logits_d / temp, dim=-1),
-                F.softmax(t2_l / temp, dim=-1),
-                reduction="batchmean",
-            ) * (temp ** 2)
-            feat_d = (1.0 - F.cosine_similarity(emb_d, f2_b, dim=-1)).mean() + 2.0 * F.smooth_l1_loss(emb_d, f2_b)
-            loss_d = 0.3 * ce_d + 0.4 * kl_d_from_conv + 0.3 * kl_d_self + 2.0 * feat_d
-
-            loss = 0.5 * (loss_c + loss_d)
-
-            optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            model.mask_deleted_filter_grads()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=2.0)
-            optimizer.step()
-
-            bs = y_b.size(0)
-            total_loss += loss.item() * bs
-            corr_c += (logits_c.argmax(dim=-1) == y_b).sum().item()
-            corr_d += (logits_d.argmax(dim=-1) == y_b).sum().item()
-            corr_e += (logits_e.argmax(dim=-1) == y_b).sum().item()
-            total += bs
-
-        scheduler.step()
-
-        if epoch % 5 == 0 or epoch == 1 or epoch == 72 or epoch == args.epochs:
-            val_m = evaluate_graph_editor(model, val_test_data["validation"], joint_probe, device)
-            elapsed = time.time() - t_start
-            print(
-                f"Epoch [{epoch:3d}/{args.epochs}] | Deleted: {100.0*total_del/1792:4.1f}% ({total_del:3d}/1792 | "
-                f"Alive: Conv={c_alive}, DINO={d_alive}) | Loss: {total_loss/total:.3f} | "
-                f"Val: [Conv: {val_m['conv_top1']:.2f}% | DINO: {val_m['dino_top1']:.2f}% | "
-                f"Ens: {val_m['ens_top1']:.2f}% (Top-5: {val_m['ens_top5']:.2f}%)] | {elapsed:.1f}s"
-            )
-
-        # Save best checkpoint once target node deletion budget has been reached (Epoch >= 72)
-        if epoch >= 72:
-            val_m = evaluate_graph_editor(model, val_test_data["validation"], joint_probe, device)
-            if val_m["ens_top1"] > best_full_edit_val:
-                best_full_edit_val = val_m["ens_top1"]
-                torch.save(
-                    {
-                        "epoch": epoch,
-                        "model_state_dict": model.state_dict(),
-                        "alive_mask": model.alive_mask,
-                        "deleted_ratio": total_del / 1792.0,
-                        "val_metrics": val_m,
-                    },
-                    args.save_ckpt,
+            if epoch % 5 == 0 or epoch == 1 or epoch == 72 or epoch == args.epochs:
+                val_m = evaluate_graph_editor(model, val_test_data["validation"], joint_probe, device)
+                elapsed = time.time() - t_start
+                print(
+                    f"Epoch [{epoch:3d}/{args.epochs}] | Deleted: {100.0*total_del/1792:4.1f}% ({total_del:3d}/1792 | "
+                    f"Alive: Conv={c_alive}, DINO={d_alive}) | Loss: {avg_loss:.3f} | "
+                    f"Val: [Conv: {val_m['conv_top1']:.2f}% | DINO: {val_m['dino_top1']:.2f}% | "
+                    f"Ens: {val_m['ens_top1']:.2f}% (Top-5: {val_m['ens_top5']:.2f}%)] | {elapsed:.1f}s"
                 )
 
-    # Final Evaluation on Validation & Test at Target Node Deletion
+            if epoch >= 72:
+                val_m = evaluate_graph_editor(model, val_test_data["validation"], joint_probe, device)
+                if val_m["ens_top1"] > best_full_edit_val:
+                    best_full_edit_val = val_m["ens_top1"]
+                    torch.save(
+                        {
+                            "epoch": epoch,
+                            "model_state_dict": model.state_dict(),
+                            "alive_mask": model.alive_mask,
+                            "deleted_ratio": total_del / 1792.0,
+                            "val_metrics": val_m,
+                        },
+                        args.save_ckpt,
+                    )
+
+    # Final Evaluation on Validation & Test
     ckpt = torch.load(args.save_ckpt, map_location=device, weights_only=False)
     model.load_state_dict(ckpt["model_state_dict"])
     val_final = evaluate_graph_editor(model, val_test_data["validation"], joint_probe, device)
@@ -659,8 +775,9 @@ def main():
     d_alive = int(model.alive_mask[1024:].sum().item())
 
     print("\n" + "=" * 84)
-    print(f" FINAL GRAPH-EDITED BENCHMARK ({100.0*total_del/1792:.1f}% NODES DELETED | {1792-total_del}/1792 ALIVE)")
-    print(f" Surviving Filter Nodes: ConvNeXt = {c_alive}/1024 | DINOv2 = {d_alive}/768")
+    print(f" FINAL PARETO GRAPH-EDITED BENCHMARK ({100.0*total_del/1792:.1f}% NODES DELETED | {1792-total_del}/1792 ALIVE)")
+    print(f" Surviving Filter Nodes: ConvNeXt = {c_alive}/1024 ({100.0*(1024-c_alive)/1024:.1f}% removed) | "
+          f"DINOv2 = {d_alive}/768 ({100.0*(768-d_alive)/768:.1f}% removed)")
     print("=" * 84)
     print(f"  [VALIDATION] ConvNeXt: {val_final['conv_top1']:.2f}% (Top-5: {val_final['conv_top5']:.2f}%) | "
           f"DINOv2: {val_final['dino_top1']:.2f}% (Top-5: {val_final['dino_top5']:.2f}%) | "
@@ -673,4 +790,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
