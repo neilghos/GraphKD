@@ -442,8 +442,14 @@ def main():
     parser = argparse.ArgumentParser(description="KD as Cross-Backbone Graph Editing via Cumulative MFH")
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch-size", type=int, default=256)
-    parser.add_argument("--max-delete", type=float, default=0.50, help="Target fraction of 1792 filter nodes to delete (e.g. 0.30, 0.50, 0.70)")
-    parser.add_argument("--order", type=str, default="redundancy", choices=["redundancy", "random"], help="Node deletion ordering")
+    parser.add_argument("--max-delete", type=float, default=0.50, help="Target fraction of 1792 filter nodes to delete (ignored if order is delete_dino or delete_conv)")
+    parser.add_argument(
+        "--order",
+        type=str,
+        default="redundancy",
+        choices=["redundancy", "random", "delete_dino", "delete_conv"],
+        help="Node deletion mode: 'redundancy', 'random', 'delete_dino' (delete 100% of DINOv2), or 'delete_conv' (delete 100% of ConvNeXt)",
+    )
     parser.add_argument("--top-k", type=int, default=32)
     parser.add_argument("--temp", type=float, default=2.0)
     parser.add_argument("--save-ckpt", type=str, default="graph_edited_dual_backbone.pt")
@@ -454,10 +460,15 @@ def main():
     torch.cuda.manual_seed_all(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+    if args.order == "delete_dino":
+        args.max_delete = 768.0 / 1792.0
+    elif args.order == "delete_conv":
+        args.max_delete = 1024.0 / 1792.0
+
     print("=" * 84)
     print(" CROSS-BACKBONE GRAPH EDITING VIA CUMULATIVE MFH (NO SEPARATE STUDENT)")
     print(f" Device: {device} | Epochs: {args.epochs} | Batch Size: {args.batch_size}")
-    print(f" Target Node Deletion: {args.max_delete*100:.1f}% ({int(round(args.max_delete*1792))}/1792 filters removed) | Order: {args.order}")
+    print(f" Target Node Deletion: {args.max_delete*100:.1f}% ({int(round(args.max_delete*1792))}/1792 filters removed) | Mode: {args.order}")
     print("=" * 84)
 
     # 1. Load Train Targets & One-Time Val/Test Teacher Feature Banks
@@ -487,6 +498,16 @@ def main():
 
     if args.order == "redundancy":
         node_order = redundancy_order
+    elif args.order == "delete_dino":
+        # Keep DINOv2 nodes (1024..1791) in their redundancy order first, then ConvNeXt nodes
+        dino_nodes = redundancy_order[redundancy_order >= 1024]
+        conv_nodes = redundancy_order[redundancy_order < 1024]
+        node_order = torch.cat([dino_nodes, conv_nodes], dim=0)
+    elif args.order == "delete_conv":
+        # Keep ConvNeXt nodes (0..1023) in their redundancy order first, then DINOv2 nodes
+        conv_nodes = redundancy_order[redundancy_order < 1024]
+        dino_nodes = redundancy_order[redundancy_order >= 1024]
+        node_order = torch.cat([conv_nodes, dino_nodes], dim=0)
     else:
         gen = torch.Generator()
         gen.manual_seed(args.seed)
