@@ -31,9 +31,9 @@ class DualBackbone(nn.Module):
         f2 = self.bb2(x_224)
         return f1, f2
 
-def extract_teacher_features(features_cache_path, device, batch_size=128, data_path="tiny-imagenet-200-clean/tiny-imagenet-200-clean"):
+def extract_teacher_features(device, batch_size=128, data_path="tiny-imagenet-200-clean/tiny-imagenet-200-clean"):
     print("=" * 70)
-    print(f" EXTRACTING RAW TEACHER FEATURES -> {features_cache_path}")
+    print(" EXTRACTING RAW TEACHER FEATURES (ConvNeXt-Base + DINOv2-ViT)")
     print("=" * 70)
     transform_clean = transforms.Compose([
         transforms.ToTensor(),
@@ -67,10 +67,10 @@ def extract_teacher_features(features_cache_path, device, batch_size=128, data_p
     F2 = torch.cat(f2_list, dim=0)
     all_labels = torch.cat(label_list, dim=0)
 
-    torch.save({"F1": F1, "F2": F2, "labels": all_labels}, features_cache_path)
-    print(f"Saved raw teacher features to '{features_cache_path}' ({os.path.getsize(features_cache_path)/(1024*1024):.2f} MB)\n")
     del teachers
     torch.cuda.empty_cache()
+    return F1, F2, all_labels
+
 
 def fit_probe(features, labels, device, epochs=6, batch_size=512, lr=3e-3):
     in_dim = features.shape[1]
@@ -93,6 +93,7 @@ def fit_probe(features, labels, device, epochs=6, batch_size=512, lr=3e-3):
     print(f"  Fitted Probe ({in_dim}d -> 200) Final Training Accuracy: {corr/tot*100:.2f}%")
     return probe
 
+
 def generate_logits(probe, features, device, batch_size=1024):
     probe.eval()
     dataset = torch.utils.data.TensorDataset(features)
@@ -104,54 +105,50 @@ def generate_logits(probe, features, device, batch_size=1024):
             logits_list.append(probe(x_b).half().cpu())
     return torch.cat(logits_list, dim=0)
 
+
 def main():
-    features_cache_path = "tiny_features_cache_convnext_dinov2.pt"
     save_path = "tiny_dual_targets.pt"
 
     print("=" * 70)
-    print(" PRECOMPUTING DUAL TEACHER PROBES & TARGETS (OPTION B)")
+    print(" PRECOMPUTING DUAL TEACHER PROBES & TARGETS")
     print("=" * 70)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    if not os.path.exists(features_cache_path):
-        print(f"[!] '{features_cache_path}' not found. Extracting teacher features first...")
-        extract_teacher_features(features_cache_path, device)
+    if os.path.exists(save_path):
+        print(f"[!] '{save_path}' already exists.")
+        return
 
-    print(f"Device: {device} | Loading {features_cache_path}...")
-    data = torch.load(features_cache_path, map_location="cpu", weights_only=False)
-    F1 = data["F1"].float()  # [98179, 1024] ConvNeXt-Base
-    F2 = data["F2"].float()  # [98179, 768]  DINOv2-ViT-Base
-    labels = data["labels"]  # [98179]
+    F1, F2, labels = extract_teacher_features(device)
+    F1_f = F1.float()
+    F2_f = F2.float()
 
     # 1. Fit Probe 1 on ConvNeXt-Base (1024d)
     print("\n1. Fitting ConvNeXt-Base Teacher Probe (1024d -> 200)...")
-    probe_conv = fit_probe(F1, labels, device)
-    t1_logits = generate_logits(probe_conv, F1, device)
+    probe_conv = fit_probe(F1_f, labels, device)
+    t1_logits = generate_logits(probe_conv, F1_f, device)
 
     # 2. Fit Probe 2 on DINOv2-ViT-Base (768d)
     print("\n2. Fitting DINOv2-ViT Teacher Probe (768d -> 200)...")
-    probe_dino = fit_probe(F2, labels, device)
-    t2_logits = generate_logits(probe_dino, F2, device)
+    probe_dino = fit_probe(F2_f, labels, device)
+    t2_logits = generate_logits(probe_dino, F2_f, device)
 
     # 3. Fit Joint Teacher Ensemble Probe (1792d)
     print("\n3. Fitting Joint Teacher Ensemble Probe (1792d -> 200)...")
-    F_joint = torch.cat([F1, F2], dim=1)
+    F_joint = torch.cat([F1_f, F2_f], dim=1)
     probe_joint = fit_probe(F_joint, labels, device)
-    t_joint_logits = generate_logits(probe_joint, F_joint, device)
 
     dual_targets = {
         "F1": F1.half(),                         # [98179, 1024]
         "F2": F2.half(),                         # [98179, 768]
         "t1_logits": t1_logits,                  # [98179, 200]
         "t2_logits": t2_logits,                  # [98179, 200]
-        "t_joint_logits": t_joint_logits,        # [98179, 200]
         "joint_probe_state": probe_joint.state_dict(),
         "probe_conv_state": probe_conv.state_dict(),
         "probe_dino_state": probe_dino.state_dict(),
     }
     torch.save(dual_targets, save_path)
-    print(f"\nSaved all dual targets to '{save_path}' ({os.path.getsize(save_path)/(1024*1024):.2f} MB)")
+    print(f"\nSaved essential dual targets to '{save_path}' ({os.path.getsize(save_path)/(1024*1024):.2f} MB)")
     print("=" * 70)
 
 if __name__ == "__main__":
